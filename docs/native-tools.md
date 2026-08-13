@@ -126,6 +126,68 @@ print(result.output)
 
 _(This example is complete, it can be run "as is")_
 
+### Citations
+
+When OpenAI, Anthropic, or Google returns web or file-search citations, Pydantic AI normalizes them on
+[`TextPart.citations`][pydantic_ai.messages.TextPart.citations]. The model's text is left unchanged. This matters
+because some models include a visible citation marker in their text while others attach a citation to an assertion
+without adding a marker.
+
+```python
+from pydantic_ai import Agent, TextPart, WebCitationSource
+from pydantic_ai.capabilities import NativeTool
+from pydantic_ai.native_tools import WebSearchTool
+
+agent = Agent('openai-responses:gpt-5.2', capabilities=[NativeTool(WebSearchTool())])
+result = agent.run_sync('What is the tallest mountain in Alberta?')
+
+for message in result.all_messages():
+    for part in message.parts:
+        if isinstance(part, TextPart):
+            for citation in part.citations or []:
+                for source in citation.sources:
+                    if isinstance(source, WebCitationSource):
+                        print(source.title, source.url)
+```
+
+On a completed `TextPart`, a [`CitationAnchor`][pydantic_ai.messages.CitationAnchor] always uses Python character
+indices, so `part.content[anchor.start:anchor.end]` selects the relevant text. During streaming, a citation delta may
+arrive before the rest of the anchored text. Its `kind` distinguishes two provider behaviors:
+
+- `content` identifies the assertion supported by the citation.
+- `marker` identifies citation text already rendered by the model, such as `[1]` or a Markdown link.
+
+An absent anchor means the citation is associated with the `TextPart` but no normalized character range is available.
+Values whose text-offset semantics are not established remain in `provider_details` rather than being exposed as an
+anchor. One citation may contain several sources when a provider says multiple sources support the same assertion.
+Provider-specific source metadata remains available on `source.provider_details`, while metadata about the
+citation-to-text relationship remains on `citation.provider_details`.
+
+Pydantic AI does not insert, remove, or restyle citation markers. Applications can preserve the model output as-is,
+use `marker` anchors to enhance existing markers, and use `content` anchors or whole-part citations to add their own
+footnotes, links, or source panels.
+
+| Provider API | Normalized sources | Anchor behavior |
+| --- | --- | --- |
+| OpenAI Chat Completions | URL citations | `marker` range |
+| OpenAI Responses | URL and file citations | URL markers use `marker`; file indices remain in `provider_details` because they are not text offsets |
+| Anthropic Messages | Web and file/document citations | No normalized text range; document coordinates remain in `provider_details` |
+| Google Gen AI | Web and retrieved-context sources | Grounding support uses `content`; direct citation metadata uses `content` when offsets are available |
+
+Annotations or grounding chunks outside the normalized web-search and file-search scope remain in the containing
+`TextPart.provider_details`. Anthropic citations are sent back when replaying history to Anthropic. OpenAI Responses
+citations are replayed when the output item ID is retained and sent back; without item-ID replay they remain available
+to the application but are sent as ordinary assistant text. Google does not accept response citation metadata on
+request content, so Google citations remain available to the application but are not added to subsequent requests.
+
+The Vercel AI adapter projects citation sources to its native `source-url` and `source-document` parts. That protocol
+does not represent citation anchors, multi-source grouping, excerpts, or provider details, so this projection is
+intentionally source-only. AG-UI does not currently define a citation or source event, so citations are not projected
+to an AG-UI-specific custom event.
+
+Citation URLs are model/provider output and must be treated as untrusted input. Validate or sanitize them before
+turning them into clickable links, and escape source titles or excerpts before rendering them as HTML.
+
 ### Configuration Options
 
 The `WebSearchTool` supports several configuration parameters:

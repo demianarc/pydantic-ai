@@ -1,5 +1,6 @@
 """Utilities for handling Pydantic AI and Vercel data streams."""
 
+import hashlib
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from typing import Any
@@ -9,10 +10,13 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic_ai._utils import is_str_dict
 from pydantic_ai.messages import (
     BaseToolReturnPart,
+    Citation,
+    FileCitationSource,
     ForceDownloadMode,
     ModelMessage,
     ProviderDetailsDelta,
     ToolReturnPart,
+    WebCitationSource,
     tool_return_ta,
 )
 from pydantic_ai.ui.vercel_ai.request_types import (
@@ -192,6 +196,29 @@ def iter_metadata_chunks(
         for item in possible:  # type: ignore[reportUnknownMemberType]
             if isinstance(item, _DATA_CHUNK_TYPES):  # pragma: no branch
                 yield item
+
+
+def iter_citation_source_chunks(citations: Iterable[Citation]) -> Iterator[SourceUrlChunk | SourceDocumentChunk]:
+    """Map normalized citations to Vercel AI SDK source chunks."""
+    for citation in citations:
+        for source in citation.sources:
+            if isinstance(source, WebCitationSource):
+                yield SourceUrlChunk(source_id=source.url, url=source.url, title=source.title)
+            elif isinstance(source, FileCitationSource):
+                source_id = (
+                    source.file_id
+                    or source.url
+                    or source.title
+                    or f'citation-{hashlib.sha256((source.content or "").encode()).hexdigest()[:16]}'
+                )
+                media_type = (source.provider_details or {}).get('media_type')
+                yield SourceDocumentChunk(
+                    source_id=source_id,
+                    media_type=media_type if isinstance(media_type, str) else 'application/octet-stream',
+                    title=source.title or source.file_id or source.url or 'Source document',
+                    filename=source.title,
+                    provider_metadata=dump_provider_metadata(file_id=source.file_id, url=source.url),
+                )
 
 
 _TOOL_PART_TYPES = (

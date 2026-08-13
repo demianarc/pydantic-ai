@@ -8,8 +8,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import cached_property
-from typing import Any, Literal, cast, get_args, overload
-from uuid import uuid4
+from typing import Any, Literal, TypeAlias, cast, get_args, overload
+from uuid import UUID, uuid4
 
 from typing_extensions import assert_never
 
@@ -19,7 +19,11 @@ from ..exceptions import ModelAPIError, ModelHTTPError, UserError
 from ..messages import (
     BinaryContent,
     CachePoint,
+    Citation,
+    CitationAnchor,
+    CitationSource,
     CompactionPart,
+    FileCitationSource,
     FilePart,
     FileUrl,
     FinishReason,
@@ -42,6 +46,7 @@ from ..messages import (
     UploadedFile,
     UserPromptPart,
     VideoUrl,
+    WebCitationSource,
 )
 from ..native_tools import (
     AbstractNativeTool,
@@ -73,6 +78,7 @@ try:
     from google.genai import Client, errors
     from google.genai.types import (
         BlobDict,
+        CitationMetadata,
         CodeExecutionResult,
         CodeExecutionResultDict,
         ContentDict,
@@ -95,6 +101,7 @@ try:
         GenerateContentResponse,
         GenerationConfigDict,
         GoogleSearchDict,
+        GroundingChunk,
         GroundingMetadata,
         HttpOptionsDict,
         ImageConfigDict,
@@ -105,6 +112,7 @@ try:
         Part,
         PartDict,
         SafetySettingDict,
+        Segment,
         ServiceTier as _GoogleSDKServiceTier,
         ThinkingConfigDict,
         ToolCall,
@@ -1021,6 +1029,7 @@ class GoogleModel(Model[Client]):
 
         usage = _metadata_as_usage(response, provider=self._provider.name, provider_url=self._provider.base_url)
         grounding_metadata = candidate.grounding_metadata if candidate else None
+        citation_metadata = candidate.citation_metadata if candidate else None
         url_context_metadata = candidate.url_context_metadata if candidate else None
 
         return _process_response_from_parts(
@@ -1031,6 +1040,7 @@ class GoogleModel(Model[Client]):
             self._provider.base_url,
             usage,
             provider_response_id=provider_response_id,
+            citation_metadata=citation_metadata,
             provider_details=provider_details or None,
             finish_reason=finish_reason,
             url_context_metadata=url_context_metadata,
@@ -1315,6 +1325,38 @@ class GoogleModel(Model[Client]):
         return response_schema
 
 
+_GoogleStreamPartKind: TypeAlias = Literal[
+    'text',
+    'thinking',
+    'function_call',
+    'inline_data',
+    'tool_call',
+    'tool_response',
+    'executable_code',
+    'code_execution_result',
+    'function_response',
+]
+
+
+def _stream_part_kind(part: Part) -> _GoogleStreamPartKind:
+    if part.text is not None:
+        return 'thinking' if part.thought else 'text'
+    if part.function_call:
+        return 'function_call'
+    if part.inline_data is not None:
+        return 'inline_data'
+    if part.tool_call:
+        return 'tool_call'
+    if part.tool_response:
+        return 'tool_response'
+    if part.executable_code is not None:
+        return 'executable_code'
+    if part.code_execution_result is not None:
+        return 'code_execution_result'
+    assert part.function_response is not None, f'Unexpected part: {part}'
+    return 'function_response'
+
+
 @dataclass
 class GeminiStreamedResponse(StreamedResponse):
     """Implementation of `StreamedResponse` for the Gemini model."""
@@ -1329,6 +1371,9 @@ class GeminiStreamedResponse(StreamedResponse):
     _code_execution_tool_call_id: str | None = field(default=None, init=False)
     _has_content_filter: bool = field(default=False, init=False)
     _has_tool_invocations: bool = field(default=False, init=False)
+    _part_ids: list[UUID | None] = field(default_factory=list[UUID | None], init=False)
+    _active_part_kinds: list[_GoogleStreamPartKind] = field(default_factory=list[_GoogleStreamPartKind], init=False)
+    _active_part_ids: list[UUID | None] = field(default_factory=list[UUID | None], init=False)
     # Empty file_search returns whose contexts are still to arrive in `grounding_metadata` (see
     # `_fill_empty_file_search_return_content`). Each is reserved in the parts manager keyed by its
     # `tool_call_id`, with its `PartStartEvent` deferred until it's filled — or until the stream ends.
@@ -1338,6 +1383,18 @@ class GeminiStreamedResponse(StreamedResponse):
 
     async def close_stream(self) -> None:
         await self._response.aclose()
+
+    def _stream_part_id(self, part_index: int, part_kind: _GoogleStreamPartKind) -> UUID | None:
+        if part_index < len(self._active_part_kinds) and self._active_part_kinds[part_index] == part_kind:
+            return self._active_part_ids[part_index]
+
+        del self._active_part_kinds[part_index:]
+        del self._active_part_ids[part_index:]
+        part_id = uuid4() if part_kind == 'text' else None
+        self._active_part_kinds.append(part_kind)
+        self._active_part_ids.append(part_id)
+        self._part_ids.append(part_id)
+        return part_id
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         if self._provider_timestamp is not None:
@@ -1430,17 +1487,15 @@ class GeminiStreamedResponse(StreamedResponse):
                         yield self._parts_manager.handle_part(vendor_part_id=uuid4(), part=web_fetch_call)
                         yield self._parts_manager.handle_part(vendor_part_id=uuid4(), part=web_fetch_return)
 
-                if candidate.content is None or candidate.content.parts is None:
-                    continue
-
-                parts = candidate.content.parts
-                if not parts:
-                    continue  # pragma: no cover
+                parts = (candidate.content and candidate.content.parts) or []
 
                 if not self._has_tool_invocations:
                     self._has_tool_invocations = _has_native_tool_invocations(parts)
 
-                for part in parts:
+                for part_index, part in enumerate(parts):
+                    part_kind = _stream_part_kind(part)
+                    part_id = self._stream_part_id(part_index, part_kind)
+
                     provider_details: dict[str, Any] | None = None
                     if part.thought_signature:
                         # Per https://ai.google.dev/gemini-api/docs/function-calling?example=meeting#thought-signatures:
@@ -1462,8 +1517,9 @@ class GeminiStreamedResponse(StreamedResponse):
                             ):
                                 yield event
                         else:
+                            assert part_id is not None
                             for event in self._parts_manager.handle_text_delta(
-                                vendor_part_id=None,
+                                vendor_part_id=part_id,
                                 content=part.text,
                                 provider_name=self.provider_name if provider_details else None,
                                 provider_details=provider_details,
@@ -1525,6 +1581,58 @@ class GeminiStreamedResponse(StreamedResponse):
                         yield self._parts_manager.handle_part(vendor_part_id=uuid4(), part=part)
                     else:
                         assert part.function_response is not None, f'Unexpected part: {part}'  # pragma: no cover
+
+                if parts:
+                    del self._active_part_kinds[len(parts) :]
+                    del self._active_part_ids[len(parts) :]
+
+                if candidate.grounding_metadata or candidate.citation_metadata:
+                    google_parts = [Part() for _ in self._part_ids]
+                    text_parts: dict[int, TextPart] = {}
+                    text_part_ids: dict[int, UUID] = {}
+                    for index, part_id in enumerate(self._part_ids):
+                        if part_id is None:
+                            continue
+                        text_part = self._parts_manager.get_part_by_vendor_id(part_id)
+                        if isinstance(text_part, TextPart):
+                            text_parts[index] = text_part
+                            text_part_ids[index] = part_id
+                            google_parts[index] = Part(text=text_part.content)
+                    grounding_citations = _map_grounding_citations(google_parts, candidate.grounding_metadata)
+                    direct_citations = _map_citation_metadata(google_parts, candidate.citation_metadata)
+                    mapped = {index: list(citations) for index, citations in grounding_citations.items()}
+                    for index, citations in direct_citations.items():
+                        mapped.setdefault(index, []).extend(citations)
+                    for index, citations in mapped.items():
+                        text_part = text_parts[index]
+                        new_citations = [
+                            citation for citation in citations if citation not in (text_part.citations or [])
+                        ]
+                        if new_citations:
+                            for event in self._parts_manager.handle_text_delta(
+                                vendor_part_id=text_part_ids[index],
+                                content='',
+                                provider_name=self.provider_name,
+                                citations=new_citations,
+                            ):
+                                yield event
+                    unsupported_metadata = _unsupported_citation_metadata(
+                        candidate.grounding_metadata,
+                        candidate.citation_metadata,
+                        grounding_citations,
+                        direct_citations,
+                    )
+                    last_text_part_id = next((part_id for part_id in reversed(self._part_ids) if part_id), None)
+                    if last_text_part_id and unsupported_metadata:
+                        for event in self._parts_manager.handle_text_delta(
+                            vendor_part_id=last_text_part_id,
+                            content='',
+                            provider_name=self.provider_name,
+                            provider_details=unsupported_metadata,
+                        ):
+                            yield event
+                    elif unsupported_metadata:
+                        self.provider_details = {**(self.provider_details or {}), **unsupported_metadata}
 
                 # Grounding metadata is attached to the final text chunk, so
                 # we emit the `NativeToolReturnPart` after the text delta so
@@ -1868,6 +1976,181 @@ def _process_part(
     return item, code_execution_tool_call_id
 
 
+def _character_index(text: str, byte_index: int) -> int | None:
+    """Convert a Gemini UTF-8 byte offset to a Python string index."""
+    encoded = text.encode()
+    if not 0 <= byte_index <= len(encoded):
+        return None
+    try:
+        return len(encoded[:byte_index].decode())
+    except UnicodeDecodeError:
+        return None
+
+
+def _grounding_support_part_index(parts: Sequence[Part], segment: Segment) -> int | None:
+    if segment.part_index is not None and 0 <= segment.part_index < len(parts):
+        part = parts[segment.part_index]
+        if segment.text is None or (part.text and segment.text in part.text):
+            return segment.part_index
+    if segment.text is not None:
+        candidates = [index for index, part in enumerate(parts) if part.text and segment.text in part.text]
+        if len(candidates) == 1:
+            return candidates[0]
+    text_parts = [index for index, part in enumerate(parts) if part.text]
+    return text_parts[0] if len(text_parts) == 1 else None
+
+
+def _map_grounding_source(chunk: GroundingChunk) -> CitationSource | None:
+    if (web := chunk.web) and web.uri:
+        return WebCitationSource(
+            url=web.uri,
+            title=web.title,
+            provider_details={'domain': web.domain} if web.domain else None,
+        )
+    if context := chunk.retrieved_context:
+        details = context.model_dump(mode='json', exclude_none=True, by_alias=False)
+        url = context.uri or next(
+            (
+                item.string_value
+                for item in context.custom_metadata or []
+                if item.key == 'source_url' and item.string_value
+            ),
+            None,
+        )
+        if any((context.document_name, url, context.title, context.text)):
+            return FileCitationSource(
+                file_id=context.document_name,
+                url=url,
+                title=context.title,
+                content=context.text,
+                provider_details={
+                    key: value for key, value in details.items() if key not in {'document_name', 'uri', 'title', 'text'}
+                }
+                or None,
+            )
+    return None
+
+
+def _map_grounding_citations(
+    parts: Sequence[Part], grounding_metadata: GroundingMetadata | None
+) -> dict[int, list[Citation]]:
+    if not grounding_metadata or not grounding_metadata.grounding_supports:
+        return {}
+
+    chunks = grounding_metadata.grounding_chunks or []
+    citations_by_part: dict[int, list[Citation]] = {}
+    for support in grounding_metadata.grounding_supports:
+        segment = support.segment
+        if segment is None or segment.end_index is None:
+            continue
+        part_index = _grounding_support_part_index(parts, segment)
+        if part_index is None or part_index >= len(parts) or (text := parts[part_index].text) is None:
+            continue
+
+        sources = [
+            source
+            for chunk_index in support.grounding_chunk_indices or []
+            if 0 <= chunk_index < len(chunks)
+            if (source := _map_grounding_source(chunks[chunk_index])) is not None
+        ]
+
+        if sources:
+            start = _character_index(text, segment.start_index or 0)
+            end = _character_index(text, segment.end_index)
+            if start is None or end is None or start > end:
+                continue
+            citations_by_part.setdefault(part_index, []).append(
+                Citation(
+                    sources=sources,
+                    anchor=CitationAnchor(start, end, kind='content'),
+                    provider_details={'confidence_scores': support.confidence_scores}
+                    if support.confidence_scores
+                    else None,
+                )
+            )
+    return citations_by_part
+
+
+def _unsupported_citation_metadata(
+    grounding_metadata: GroundingMetadata | None,
+    citation_metadata: CitationMetadata | None,
+    grounding_citations: dict[int, list[Citation]],
+    direct_citations: dict[int, list[Citation]],
+) -> dict[str, Any] | None:
+    details: dict[str, Any] = {}
+    grounding_metadata = grounding_metadata if isinstance(grounding_metadata, GroundingMetadata) else None
+    citation_metadata = citation_metadata if isinstance(citation_metadata, CitationMetadata) else None
+    grounding_supports = (grounding_metadata and grounding_metadata.grounding_supports) or []
+    grounding_chunks = (grounding_metadata and grounding_metadata.grounding_chunks) or []
+    has_unmapped_source = any(
+        chunk_index < 0
+        or chunk_index >= len(grounding_chunks)
+        or _map_grounding_source(grounding_chunks[chunk_index]) is None
+        for support in grounding_supports
+        for chunk_index in support.grounding_chunk_indices or []
+    )
+    if grounding_metadata and (
+        any(chunk.maps or chunk.image for chunk in grounding_chunks)
+        or has_unmapped_source
+        or sum(map(len, grounding_citations.values())) < len(grounding_supports)
+    ):
+        details['unsupported_grounding_metadata'] = grounding_metadata.model_dump(mode='json', exclude_none=True)
+    raw_citations = (citation_metadata and citation_metadata.citations) or []
+    if citation_metadata and sum(map(len, direct_citations.values())) < len(raw_citations):
+        details['unsupported_citation_metadata'] = citation_metadata.model_dump(mode='json', exclude_none=True)
+    return details or None
+
+
+def _map_citation_metadata(parts: Sequence[Part], metadata: CitationMetadata | None) -> dict[int, list[Citation]]:
+    if not isinstance(metadata, CitationMetadata) or not metadata.citations:
+        return {}
+
+    text_parts = [(index, part.text) for index, part in enumerate(parts) if part.text is not None]
+    boundaries: list[tuple[int, int, int, str]] = []
+    byte_offset = 0
+    for index, text in text_parts:
+        assert text is not None
+        end = byte_offset + len(text.encode())
+        boundaries.append((index, byte_offset, end, text))
+        byte_offset = end
+
+    citations_by_part: dict[int, list[Citation]] = {}
+    for raw in metadata.citations:
+        if not raw.uri:
+            continue
+        target: tuple[int, CitationAnchor | None] | None = None
+        if raw.start_index is None or raw.end_index is None:
+            if len(text_parts) == 1:
+                target = text_parts[0][0], None
+        else:
+            for part_index, part_start, part_end, text in boundaries:
+                if part_start <= raw.start_index <= raw.end_index <= part_end:
+                    start = _character_index(text, raw.start_index - part_start)
+                    end = _character_index(text, raw.end_index - part_start)
+                    if start is not None and end is not None:
+                        target = part_index, CitationAnchor(start, end, kind='content')
+                    break
+        if target is None:
+            continue
+        source_details = raw.model_dump(
+            mode='json', exclude={'start_index', 'end_index', 'uri', 'title'}, exclude_none=True
+        )
+        part_index, anchor = target
+        citations_by_part.setdefault(part_index, []).append(
+            Citation(
+                sources=[
+                    WebCitationSource(
+                        url=raw.uri,
+                        title=raw.title,
+                        provider_details=source_details or None,
+                    )
+                ],
+                anchor=anchor,
+            )
+        )
+    return citations_by_part
+
+
 def _process_response_from_parts(
     parts: list[Part],
     grounding_metadata: GroundingMetadata | None,
@@ -1876,6 +2159,7 @@ def _process_response_from_parts(
     provider_url: str,
     usage: usage.RequestUsage,
     provider_response_id: str | None,
+    citation_metadata: CitationMetadata | None = None,
     provider_details: dict[str, Any] | None = None,
     finish_reason: FinishReason | None = None,
     url_context_metadata: UrlContextMetadata | None = None,
@@ -1899,12 +2183,30 @@ def _process_response_from_parts(
 
     item: ModelResponsePart | None = None
     code_execution_tool_call_id: str | None = None
-    for part in parts:
+    grounding_citations = _map_grounding_citations(parts, grounding_metadata)
+    direct_citations = _map_citation_metadata(parts, citation_metadata)
+    citations_by_part = {index: list(citations) for index, citations in grounding_citations.items()}
+    for part_index, citations in direct_citations.items():
+        citations_by_part.setdefault(part_index, []).extend(citations)
+    for part_index, part in enumerate(parts):
         item, code_execution_tool_call_id = _process_part(part, code_execution_tool_call_id, provider_name)
         if item is not None:
+            if isinstance(item, TextPart):
+                item.citations = citations_by_part.get(part_index)
+                if item.citations:
+                    item.provider_name = provider_name
             if isinstance(item, NativeToolReturnPart):
                 _fill_empty_file_search_return_content(item, grounding_metadata)
             items.append(item)
+
+    if unsupported_metadata := _unsupported_citation_metadata(
+        grounding_metadata, citation_metadata, grounding_citations, direct_citations
+    ):
+        if text_item := next((item for item in reversed(items) if isinstance(item, TextPart)), None):
+            text_item.provider_name = provider_name
+            text_item.provider_details = {**(text_item.provider_details or {}), **unsupported_metadata}
+        else:
+            provider_details = {**(provider_details or {}), **unsupported_metadata}
 
     return ModelResponse(
         parts=items,

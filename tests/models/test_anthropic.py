@@ -4,6 +4,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -22,7 +23,9 @@ from pydantic_ai import (
     Agent,
     BinaryContent,
     CachePoint,
+    Citation,
     DocumentUrl,
+    FileCitationSource,
     FinalResultEvent,
     ImageUrl,
     ModelAPIError,
@@ -52,6 +55,7 @@ from pydantic_ai import (
     ToolReturnPart,
     UsageLimitExceeded,
     UserPromptPart,
+    WebCitationSource,
 )
 from pydantic_ai._agent_graph import ModelRequestNode
 from pydantic_ai._utils import PeekableAsyncStream
@@ -121,6 +125,7 @@ with try_import() as imports_successful:
         BetaAdvisorResultBlock,
         BetaAdvisorToolResultBlock,
         BetaAdvisorToolResultError,
+        BetaCitationCharLocation,
         BetaCodeExecutionResultBlock,
         BetaCodeExecutionToolResultBlock,
         BetaCompactionBlock,
@@ -166,6 +171,8 @@ with try_import() as imports_successful:
         AnthropicModel,
         AnthropicModelSettings,
         AnthropicStreamedResponse,
+        _map_citations,  # pyright: ignore[reportPrivateUsage]
+        _map_citations_to_params,  # pyright: ignore[reportPrivateUsage]
         _map_usage,  # pyright: ignore[reportPrivateUsage]
     )
     from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
@@ -187,6 +194,134 @@ pytestmark = [
         "ignore:The model 'claude-sonnet-4-0' is deprecated and will reach end-of-life.*:DeprecationWarning"
     ),
 ]
+
+
+def _remove_citations(messages: Sequence[ModelMessage] = (), events: list[Any] | None = None) -> list[Citation]:
+    """Collect citations while masking them from pre-citation snapshots."""
+    citations: list[Citation] = []
+    for model_message in messages:
+        if isinstance(model_message, ModelResponse):
+            for part in model_message.parts:
+                if isinstance(part, TextPart) and part.citations:
+                    citations.extend(part.citations)
+                    part.citations = None
+                    if part.provider_details is None:
+                        part.provider_name = None
+    citation_only_events: set[int] = set()
+    for event in events or []:
+        if isinstance(event, PartStartEvent | PartEndEvent) and isinstance(event.part, TextPart):
+            if event.part.citations:
+                citations.extend(event.part.citations)
+                event.part.citations = None
+                if event.part.provider_details is None:
+                    event.part.provider_name = None
+        elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+            if event.delta.citations_delta:
+                citations.extend(event.delta.citations_delta)
+                if not event.delta.content_delta and event.delta.provider_details is None:
+                    citation_only_events.add(id(event))
+                event.delta.citations_delta = None
+                if event.delta.provider_details is None:
+                    event.delta.provider_name = None
+    if events is not None:
+        events[:] = [event for event in events if id(event) not in citation_only_events]
+    return citations
+
+
+def test_anthropic_file_citation_is_normalized_and_replayable():
+    citation = BetaCitationCharLocation(
+        cited_text='source excerpt',
+        document_index=0,
+        document_title='report.pdf',
+        start_char_index=10,
+        end_char_index=24,
+        type='char_location',
+    )
+
+    citations, provider_details = _map_citations([citation])
+
+    assert provider_details is None
+    assert citations == [
+        Citation(
+            sources=[FileCitationSource(title='report.pdf', content='source excerpt')],
+            provider_details={
+                'type': 'char_location',
+                'document_index': 0,
+                'start_char_index': 10,
+                'end_char_index': 24,
+            },
+        )
+    ]
+    part = TextPart('answer', provider_name='anthropic', citations=citations)
+    assert _map_citations_to_params(part) == [
+        {
+            'type': 'char_location',
+            'document_index': 0,
+            'document_title': 'report.pdf',
+            'start_char_index': 10,
+            'end_char_index': 24,
+            'cited_text': 'source excerpt',
+        }
+    ]
+
+
+def test_anthropic_citations_are_replayed_to_the_same_provider():
+    part = TextPart(
+        'answer',
+        provider_name='anthropic',
+        citations=[
+            Citation(
+                sources=[
+                    WebCitationSource(
+                        url='https://example.com',
+                        title='Example',
+                        content='source excerpt',
+                        provider_details={'encrypted_index': 'opaque-index'},
+                    )
+                ]
+            )
+        ],
+    )
+
+    assert _map_citations_to_params(part) == [
+        {
+            'type': 'web_search_result_location',
+            'url': 'https://example.com',
+            'title': 'Example',
+            'cited_text': 'source excerpt',
+            'encrypted_index': 'opaque-index',
+        }
+    ]
+
+
+async def test_anthropic_does_not_replay_citations_from_explicit_foreign_part(allow_model_requests: None):
+    response = completion_message([BetaTextBlock(text='ok', type='text')], BetaUsage(input_tokens=1, output_tokens=1))
+    mock_client = MockAnthropic.create_mock(response)
+    model = AnthropicModel('claude-sonnet-4-6', provider=AnthropicProvider(anthropic_client=mock_client))
+    citation = Citation(
+        sources=[
+            WebCitationSource(
+                url='https://example.com',
+                provider_details={'encrypted_index': 'foreign-index'},
+            )
+        ]
+    )
+
+    await model.request(
+        [
+            ModelResponse(
+                parts=[TextPart('answer', provider_name='other', citations=[citation])],
+                provider_name='anthropic',
+            )
+        ],
+        None,
+        ModelRequestParameters(),
+    )
+
+    assert get_mock_chat_completion_kwargs(mock_client)[0]['messages'] == [
+        {'role': 'assistant', 'content': [{'text': 'answer', 'type': 'text'}]}
+    ]
+
 
 # Type variable for generic AsyncStream
 T = TypeVar('T')
@@ -5186,7 +5321,15 @@ async def test_anthropic_web_search_tool(
             None,
         )
     )
-    assert result.all_messages() == snapshot(
+    messages = result.all_messages()
+    snapshot_messages = deepcopy(messages)
+    citations = _remove_citations(snapshot_messages)
+    assert citations and all(citation.anchor is None for citation in citations)
+    assert isinstance(citations[0].sources[0], WebCitationSource)
+    assert (
+        citations[0].sources[0].url == 'https://www.accuweather.com/en/us/san-francisco/94103/weather-forecast/347629'
+    )
+    assert snapshot_messages == snapshot(
         [
             ModelRequest(
                 parts=[UserPromptPart(content='What is the weather in San Francisco today?', timestamp=IsDatetime())],
@@ -5394,7 +5537,15 @@ Overall, it's a pleasant day in San Francisco with mild temperatures and mostly 
 
     messages = result.all_messages()
     result = await agent.run(user_prompt='how about Mexico City?', message_history=messages)
-    assert result.new_messages() == snapshot(
+    assert any(
+        block.get('citations')
+        for message in request_capture.body(index=-1)['messages']
+        if message['role'] == 'assistant'
+        for block in message['content']
+    )
+    new_messages = result.new_messages()
+    assert _remove_citations(new_messages)
+    assert new_messages == snapshot(
         [
             ModelRequest(
                 parts=[
@@ -5614,6 +5765,21 @@ async def test_anthropic_model_web_search_tool_stream(
 
     assert agent_run.result is not None
     messages = agent_run.result.all_messages()
+    citation_event_indices = {
+        event.index
+        for event in event_parts
+        if (
+            isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta) and event.delta.citations_delta
+        )
+        or (isinstance(event, PartEndEvent) and isinstance(event.part, TextPart) and event.part.citations)
+    }
+    assert citation_event_indices
+    assert citation_event_indices <= {
+        event.index for event in event_parts if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart)
+    }
+    citations = _remove_citations(messages, event_parts)
+    assert citations and all(citation.anchor is None for citation in citations)
+    assert all(isinstance(citation.sources[0], WebCitationSource) for citation in citations)
     assert (request_capture.body()['tools'], request_capture.body().get('tool_choice')) == snapshot(
         (
             [
@@ -10616,6 +10782,10 @@ async def test_anthropic_web_search_tool_stream(
                     async for event in request_stream:
                         event_parts.append(event)
 
+    citations = _remove_citations(events=event_parts)
+    assert citations and all(citation.anchor is None for citation in citations)
+    assert all(isinstance(citation.sources[0], WebCitationSource) for citation in citations)
+
     assert (request_capture.body()['tools'], request_capture.body().get('tool_choice')) == snapshot(
         (
             [
@@ -11208,6 +11378,7 @@ In 1939, Finnish runner Taisto Mäki made history by becoming the first person t
                 "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building",
                 "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building in Washington DC, and he",
                 "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building in Washington DC, and he would return periodically to oversee its",
+                "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building in Washington DC, and he would return periodically to oversee its construction personally",
                 "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building in Washington DC, and he would return periodically to oversee its construction personally",
                 "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building in Washington DC, and he would return periodically to oversee its construction personally.",
                 "Here's one notable historical event that occurred on September 18th: On September 18, 1793, President George Washington marked the location for the Capitol Building in Washington DC, and he would return periodically to oversee its construction personally.",

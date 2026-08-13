@@ -40,6 +40,7 @@ from ._utils import (
     TOOL_AVAILABILITY_DELTA_DATA_TYPE,
     dump_message_metadata,
     dump_provider_metadata,
+    iter_citation_source_chunks,
     iter_metadata_chunks,
     tool_return_output,
 )
@@ -204,6 +205,8 @@ class VercelAIEventStream(UIEventStream[RequestData, BaseChunk, AgentDepsT, Outp
 
         if part.content:
             yield TextDeltaChunk(id=message_id, delta=part.content, provider_metadata=provider_metadata)
+        for chunk in iter_citation_source_chunks(part.citations or []):
+            yield chunk
 
     async def handle_text_delta(self, delta: TextPartDelta) -> AsyncIterator[BaseChunk]:
         if delta.content_delta:  # pragma: no branch
@@ -211,6 +214,8 @@ class VercelAIEventStream(UIEventStream[RequestData, BaseChunk, AgentDepsT, Outp
                 provider_name=delta.provider_name, provider_details=delta.provider_details
             )
             yield TextDeltaChunk(id=self.message_id, delta=delta.content_delta, provider_metadata=provider_metadata)
+        for chunk in iter_citation_source_chunks(delta.citations_delta or []):
+            yield chunk
 
     async def handle_text_end(self, part: TextPart, followed_by_text: bool = False) -> AsyncIterator[BaseChunk]:
         if not followed_by_text:

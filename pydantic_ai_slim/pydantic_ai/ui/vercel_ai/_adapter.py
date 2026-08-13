@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import KW_ONLY, InitVar, dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -19,8 +19,10 @@ from ...messages import (
     AudioUrl,
     BinaryContent,
     CachePoint,
+    Citation,
     CompactionPart,
     DocumentUrl,
+    FileCitationSource,
     FilePart,
     ForceDownloadMode,
     ImageUrl,
@@ -43,6 +45,7 @@ from ...messages import (
     UserContent,
     UserPromptPart,
     VideoUrl,
+    WebCitationSource,
     narrow_message_parts,
     parse_tool_kind,
     tool_return_content_ta,
@@ -63,6 +66,7 @@ from ._utils import (
     apply_message_metadata,
     dump_message_metadata,
     dump_provider_metadata,
+    iter_citation_source_chunks,
     iter_metadata_chunks,
     iter_tool_approval_responses,
     load_provider_metadata,
@@ -592,11 +596,19 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                         # Contains custom data that shouldn't be sent to the model
                         pass
                     elif isinstance(part, SourceUrlUIPart):  # pragma: no cover
-                        # TODO: Once we support citations: https://github.com/pydantic/pydantic-ai/issues/3126
-                        pass
+                        _append_citation_source(builder, WebCitationSource(url=part.url, title=part.title))
                     elif isinstance(part, SourceDocumentUIPart):  # pragma: no cover
-                        # TODO: Once we support citations: https://github.com/pydantic/pydantic-ai/issues/3126
-                        pass
+                        provider_meta = load_provider_metadata(part.provider_metadata)
+                        file_id = provider_meta.get('file_id')
+                        url = provider_meta.get('url')
+                        _append_citation_source(
+                            builder,
+                            FileCitationSource(
+                                file_id=file_id if isinstance(file_id, str) else None,
+                                url=url if isinstance(url, str) else None,
+                                title=part.filename or part.title,
+                            ),
+                        )
                     elif isinstance(part, StepStartUIPart):  # pragma: no cover
                         # Nothing to do here
                         pass
@@ -706,6 +718,7 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                         provider_details=part.provider_details,
                     )
                     ui_parts.append(TextUIPart(text=part.content, state='done', provider_metadata=provider_metadata))
+                ui_parts.extend(_chunks_to_ui_parts(iter_citation_source_chunks(part.citations or [])))
             elif isinstance(part, ThinkingPart):
                 provider_metadata = dump_provider_metadata(
                     id=part.id,
@@ -1183,17 +1196,11 @@ def _js_binary_to_bytes(data: Any) -> Any:
     return data  # pyright: ignore[reportUnknownVariableType]
 
 
-def _extract_metadata_ui_parts(tool_result: ToolReturnPart) -> list[UIMessagePart]:
-    """Convert data-carrying chunks from tool metadata into UIMessageParts.
-
-    Both this dump path and the streaming path use `iter_metadata_chunks`,
-    but the streaming path yields raw chunk objects (preserving `transient`
-    and other chunk-specific fields) while this path converts to persisted
-    `UIMessagePart` equivalents — matching Vercel AI SDK semantics where
-    transient data is streamed but not persisted.
-    """
+def _chunks_to_ui_parts(
+    chunks: Iterable[DataChunk | SourceUrlChunk | SourceDocumentChunk | FileChunk],
+) -> list[UIMessagePart]:
     parts: list[UIMessagePart] = []
-    for chunk in iter_metadata_chunks(tool_result):
+    for chunk in chunks:
         if isinstance(chunk, DataChunk):
             parts.append(DataUIPart(type=chunk.type, id=chunk.id, data=chunk.data))
         elif isinstance(chunk, SourceUrlChunk):
@@ -1220,3 +1227,22 @@ def _extract_metadata_ui_parts(tool_result: ToolReturnPart) -> list[UIMessagePar
         else:
             assert_never(chunk)
     return parts
+
+
+def _extract_metadata_ui_parts(tool_result: ToolReturnPart) -> list[UIMessagePart]:
+    """Convert data-carrying chunks from tool metadata into UIMessageParts.
+
+    Both this dump path and the streaming path use `iter_metadata_chunks`,
+    but the streaming path yields raw chunk objects (preserving `transient`
+    and other chunk-specific fields) while this path converts to persisted
+    `UIMessagePart` equivalents — matching Vercel AI SDK semantics where
+    transient data is streamed but not persisted.
+    """
+    return _chunks_to_ui_parts(iter_metadata_chunks(tool_result))
+
+
+def _append_citation_source(builder: MessagesBuilder, source: WebCitationSource | FileCitationSource) -> None:
+    """Attach a Vercel source part to the preceding response text part, if present."""
+    if builder.messages and isinstance(message := builder.messages[-1], ModelResponse):
+        if message.parts and isinstance(text_part := message.parts[-1], TextPart):
+            text_part.citations = [*(text_part.citations or []), Citation(sources=[source])]

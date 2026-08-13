@@ -2,7 +2,7 @@ from __future__ import annotations as _annotations
 
 import io
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -23,8 +23,10 @@ from ..messages import (
     AudioUrl,
     BinaryContent,
     CachePoint,
+    Citation,
     CompactionPart,
     DocumentUrl,
+    FileCitationSource,
     FilePart,
     FinishReason,
     ImageUrl,
@@ -50,6 +52,7 @@ from ..messages import (
     UploadedFile,
     UserPromptPart,
     VideoUrl,
+    WebCitationSource,
     is_multi_modal_content,
 )
 from ..native_tools import (
@@ -107,6 +110,101 @@ _FINISH_REASON_MAP: dict[BetaStopReason, FinishReason | None] = {
 }
 
 
+def _map_citations(citations: Sequence[BetaTextCitation] | None) -> tuple[list[Citation] | None, dict[str, Any] | None]:
+    mapped: list[Citation] = []
+    unsupported: list[dict[str, Any]] = []
+    for citation in citations or []:
+        values = citation.model_dump()
+        citation_type = values.get('type')
+        if citation_type == 'web_search_result_location':
+            mapped.append(
+                Citation(
+                    sources=[
+                        WebCitationSource(
+                            url=values['url'],
+                            title=values['title'],
+                            content=values['cited_text'],
+                            provider_details={'encrypted_index': values['encrypted_index']},
+                        )
+                    ]
+                )
+            )
+        elif citation_type in {'char_location', 'page_location', 'content_block_location'}:
+            mapped.append(
+                Citation(
+                    sources=[
+                        FileCitationSource(
+                            file_id=values.get('file_id'),
+                            title=values.get('document_title'),
+                            content=values['cited_text'],
+                        )
+                    ],
+                    provider_details={
+                        key: value
+                        for key, value in values.items()
+                        if key not in {'cited_text', 'document_title', 'file_id'}
+                    },
+                )
+            )
+        else:
+            unsupported.append(values)
+    return mapped or None, {'citations': unsupported} if unsupported else None
+
+
+def _map_citations_to_params(part: TextPart) -> list[BetaTextCitationParam] | None:
+    params: list[BetaTextCitationParam] = []
+    for citation in part.citations or []:
+        for source in citation.sources:
+            if isinstance(source, WebCitationSource) and (details := source.provider_details):
+                if encrypted_index := details.get('encrypted_index'):
+                    params.append(
+                        {
+                            'type': 'web_search_result_location',
+                            'url': source.url,
+                            'title': source.title,
+                            'cited_text': source.content or '',
+                            'encrypted_index': encrypted_index,
+                        }
+                    )
+            elif isinstance(source, FileCitationSource) and (details := citation.provider_details):
+                citation_type = details.get('type')
+                if citation_type == 'char_location':
+                    params.append(
+                        BetaCitationCharLocationParam(
+                            type='char_location',
+                            document_index=details['document_index'],
+                            document_title=source.title,
+                            cited_text=source.content or '',
+                            start_char_index=details['start_char_index'],
+                            end_char_index=details['end_char_index'],
+                        )
+                    )
+                elif citation_type == 'page_location':
+                    params.append(
+                        BetaCitationPageLocationParam(
+                            type='page_location',
+                            document_index=details['document_index'],
+                            document_title=source.title,
+                            cited_text=source.content or '',
+                            start_page_number=details['start_page_number'],
+                            end_page_number=details['end_page_number'],
+                        )
+                    )
+                elif citation_type == 'content_block_location':
+                    params.append(
+                        BetaCitationContentBlockLocationParam(
+                            type='content_block_location',
+                            document_index=details['document_index'],
+                            document_title=source.title,
+                            cited_text=source.content or '',
+                            start_block_index=details['start_block_index'],
+                            end_block_index=details['end_block_index'],
+                        )
+                    )
+    params.extend((part.provider_details or {}).get('citations', []))
+    return params or None
+
+
 def _revealed_deferred_tool_order(
     messages: list[ModelMessage], model_request_parameters: ModelRequestParameters
 ) -> list[str]:
@@ -158,6 +256,9 @@ try:
         BetaBashCodeExecutionToolResultBlock,
         BetaBashCodeExecutionToolResultBlockParam,
         BetaCacheControlEphemeralParam,
+        BetaCitationCharLocationParam,
+        BetaCitationContentBlockLocationParam,
+        BetaCitationPageLocationParam,
         BetaCitationsConfigParam,
         BetaCitationsDelta,
         BetaCodeExecutionTool20250825Param,
@@ -211,6 +312,8 @@ try:
         BetaStopReason,
         BetaTextBlock,
         BetaTextBlockParam,
+        BetaTextCitation,
+        BetaTextCitationParam,
         BetaTextDelta,
         BetaTextEditorCodeExecutionToolResultBlock,
         BetaTextEditorCodeExecutionToolResultBlockParam,
@@ -1232,7 +1335,15 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
         }
         for item in response.content:
             if isinstance(item, BetaTextBlock):
-                items.append(TextPart(content=item.text))
+                citations, provider_details = _map_citations(item.citations)
+                items.append(
+                    TextPart(
+                        content=item.text,
+                        provider_name=self.system if provider_details or citations else None,
+                        provider_details=provider_details,
+                        citations=citations,
+                    )
+                )
             elif isinstance(item, BetaServerToolUseBlock):
                 if item.name not in enabled_server_tool_names and item.id not in server_tool_result_ids:
                     continue
@@ -1886,7 +1997,16 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
                 for response_part in m.parts:
                     if isinstance(response_part, TextPart):
                         if response_part.content:
-                            assistant_content_params.append(BetaTextBlockParam(text=response_part.content, type='text'))
+                            citations = (
+                                _map_citations_to_params(response_part)
+                                if response_part.provider_name == self.system
+                                or (response_part.provider_name is None and m.provider_name == self.system)
+                                else None
+                            )
+                            text_block = BetaTextBlockParam(text=response_part.content, type='text')
+                            if citations:
+                                text_block['citations'] = citations
+                            assistant_content_params.append(text_block)
                     elif isinstance(response_part, ToolCallPart):
                         tool_use_block_param = BetaToolUseBlockParam(
                             id=_guard_tool_call_id(t=response_part),
@@ -2844,6 +2964,7 @@ class AnthropicStreamedResponse(StreamedResponse):
         with _map_api_errors(self._model_name):
             current_block: BetaContentBlock | None = None
             ignored_server_tool_use_indices: set[int] = set()
+            pending_citations: dict[int, list[BetaTextCitation]] = {}
 
             builtin_tool_calls: dict[str, NativeToolCallPart] = {}
             async for event in self._response:
@@ -2990,7 +3111,8 @@ class AnthropicStreamedResponse(StreamedResponse):
                         continue
                     if isinstance(event.delta, BetaTextDelta):
                         for event_ in self._parts_manager.handle_text_delta(
-                            vendor_part_id=event.index, content=event.delta.text
+                            vendor_part_id=event.index,
+                            content=event.delta.text,
                         ):
                             yield event_
                     elif isinstance(event.delta, BetaThinkingDelta):
@@ -3025,9 +3147,8 @@ class AnthropicStreamedResponse(StreamedResponse):
                                     provider_details=_compaction_provider_details(event.delta.encrypted_content),
                                 ),
                             )
-                    # TODO(Marcelo): We need to handle citations.
                     elif isinstance(event.delta, BetaCitationsDelta):
-                        pass
+                        pending_citations.setdefault(event.index, []).append(event.delta.citation)
 
                 elif isinstance(event, BetaRawMessageDeltaEvent):
                     self._usage = _map_usage(
@@ -3049,6 +3170,16 @@ class AnthropicStreamedResponse(StreamedResponse):
                         self.provider_details['container_id'] = event.delta.container.id
 
                 elif isinstance(event, BetaRawContentBlockStopEvent):  # pragma: no branch
+                    if raw_citations := pending_citations.pop(event.index, None):
+                        citations, provider_details = _map_citations(raw_citations)
+                        for event_ in self._parts_manager.handle_text_delta(
+                            vendor_part_id=event.index,
+                            content='',
+                            provider_name=self.provider_name if provider_details or citations else None,
+                            provider_details=provider_details,
+                            citations=citations,
+                        ):
+                            yield event_
                     if event.index in ignored_server_tool_use_indices:
                         ignored_server_tool_use_indices.remove(event.index)
                     elif isinstance(current_block, BetaMCPToolUseBlock):

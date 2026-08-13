@@ -24,8 +24,11 @@ from pydantic_ai.messages import (
     AudioUrl,
     BinaryContent,
     BinaryImage,
+    Citation,
+    CitationAnchor,
     CompactionPart,
     DocumentUrl,
+    FileCitationSource,
     FilePart,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -61,6 +64,7 @@ from pydantic_ai.messages import (
     UploadedFile,
     UserPromptPart,
     VideoUrl,
+    WebCitationSource,
 )
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import (
@@ -89,6 +93,7 @@ with try_import() as starlette_import_successful:
     from pydantic_ai.ui.vercel_ai import VercelAIAdapter, VercelAIEventStream
     from pydantic_ai.ui.vercel_ai._utils import (
         dump_provider_metadata,
+        iter_citation_source_chunks,
         iter_tool_approval_responses,
         load_provider_metadata,
     )
@@ -104,6 +109,8 @@ with try_import() as starlette_import_successful:
         FileUIPart,
         ReasoningUIPart,
         RegenerateMessage,
+        SourceDocumentUIPart,
+        SourceUrlUIPart,
         SubmitMessage,
         TextUIPart,
         ToolApprovalRequested,
@@ -416,6 +423,9 @@ I'd be happy to help you use a tool! However, I need more information about what
         '[DONE]' if '[DONE]' in event else json.loads(event.removeprefix('data: '))
         async for event in adapter.encode_stream(adapter.run_stream())
     ]
+    citation_sources = [event for event in events if is_str_dict(event) and event.get('type') == 'source-url']
+    assert citation_sources
+    events = [event for event in events if event not in citation_sources]
     assert events == snapshot(
         [
             {'type': 'start'},
@@ -5830,6 +5840,111 @@ async def test_adapter_dump_messages_consecutive_text():
     )
 
 
+async def test_adapter_projects_citations_to_native_source_parts():
+    messages = [
+        ModelResponse(
+            parts=[
+                TextPart(
+                    content='Answer [1]',
+                    citations=[
+                        Citation(
+                            sources=[WebCitationSource(url='https://example.com', title='Example')],
+                            anchor=CitationAnchor(7, 10, kind='marker'),
+                        ),
+                        Citation(
+                            sources=[FileCitationSource(file_id='file-1', title='report.pdf')],
+                        ),
+                    ],
+                )
+            ]
+        )
+    ]
+    [ui_message] = VercelAIAdapter.dump_messages(messages)
+
+    assert ui_message.parts == [
+        TextUIPart(text='Answer [1]', state='done'),
+        SourceUrlUIPart(source_id='https://example.com', url='https://example.com', title='Example'),
+        SourceDocumentUIPart(
+            source_id='file-1',
+            media_type='application/octet-stream',
+            title='report.pdf',
+            filename='report.pdf',
+            provider_metadata={'pydantic_ai': {'file_id': 'file-1'}},
+        ),
+    ]
+
+    # Vercel source parts do not represent anchors, multi-source grouping, excerpts, or provider details.
+    [loaded] = VercelAIAdapter.load_messages([ui_message])
+    assert isinstance(loaded, ModelResponse)
+    assert loaded.parts == [
+        TextPart(
+            content='Answer [1]',
+            citations=[
+                Citation(sources=[WebCitationSource(url='https://example.com', title='Example')]),
+                Citation(sources=[FileCitationSource(file_id='file-1', title='report.pdf')]),
+            ],
+        )
+    ]
+
+
+def test_anonymous_file_citation_source_ids_are_stable_and_distinct():
+    first = Citation(sources=[FileCitationSource(content='first')])
+    second = Citation(sources=[FileCitationSource(content='second')])
+
+    [first_chunk] = iter_citation_source_chunks([first])
+    [same_chunk] = iter_citation_source_chunks([first])
+    [second_chunk] = iter_citation_source_chunks([second])
+
+    assert isinstance(first_chunk, SourceDocumentChunk)
+    assert first_chunk.source_id == same_chunk.source_id
+    assert first_chunk.source_id != second_chunk.source_id
+
+
+def test_vercel_source_id_is_not_treated_as_provider_file_id():
+    ui_message = UIMessage(
+        id='message-1',
+        role='assistant',
+        parts=[
+            TextUIPart(text='Answer'),
+            SourceDocumentUIPart(
+                source_id='ui-source-1', media_type='application/pdf', title='Report', filename='report.pdf'
+            ),
+        ],
+    )
+
+    [loaded] = VercelAIAdapter.load_messages([ui_message])
+
+    assert isinstance(loaded, ModelResponse)
+    assert loaded.parts == [
+        TextPart(
+            content='Answer',
+            citations=[Citation(sources=[FileCitationSource(title='report.pdf')])],
+        )
+    ]
+
+
+def test_vercel_file_citation_url_uses_provider_metadata():
+    message = ModelResponse(
+        parts=[
+            TextPart(
+                'Answer',
+                citations=[Citation(sources=[FileCitationSource(url='https://example.com/report', title='Report')])],
+            )
+        ]
+    )
+
+    [ui_message] = VercelAIAdapter.dump_messages([message])
+    [loaded] = VercelAIAdapter.load_messages([ui_message])
+
+    assert isinstance(loaded, ModelResponse)
+    assert loaded.parts == [
+        TextPart(
+            'Answer',
+            citations=[Citation(sources=[FileCitationSource(url='https://example.com/report', title='Report')])],
+        )
+    ]
+
+
 async def test_adapter_dump_messages_text_with_interruption():
     """Test text concatenation with interruption."""
     messages = [
@@ -8229,6 +8344,33 @@ async def test_event_stream_text_with_provider_metadata():
             '[DONE]',
         ]
     )
+
+
+async def test_event_stream_emits_citation_sources_from_text_deltas():
+    citation = Citation(sources=[WebCitationSource(url='https://example.com', title='Example')])
+
+    async def event_generator():
+        part = TextPart(content='Answer')
+        yield PartStartEvent(index=0, part=part)
+        yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='', citations_delta=[citation]))
+        yield PartEndEvent(index=0, part=TextPart(content='Answer', citations=[citation]))
+
+    request = SubmitMessage(
+        id='foo',
+        messages=[UIMessage(id='bar', role='user', parts=[TextUIPart(text='Test')])],
+    )
+    event_stream = VercelAIEventStream(run_input=request)
+    events = [
+        '[DONE]' if '[DONE]' in event else json.loads(event.removeprefix('data: '))
+        async for event in event_stream.encode_stream(event_stream.transform_stream(event_generator()))
+    ]
+
+    assert {
+        'type': 'source-url',
+        'sourceId': 'https://example.com',
+        'url': 'https://example.com',
+        'title': 'Example',
+    } in events
 
 
 async def test_event_stream_tool_input_error_with_provider_metadata():

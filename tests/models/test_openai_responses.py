@@ -4,6 +4,7 @@ import re
 import warnings
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -20,8 +21,11 @@ from vcr.record_mode import RecordMode
 from pydantic_ai import (
     BinaryContent,
     BinaryImage,
+    Citation,
+    CitationAnchor,
     CompactionPart,
     DocumentUrl,
+    FileCitationSource,
     FilePart,
     FinalResultEvent,
     ImageGenerationTool,
@@ -49,6 +53,7 @@ from pydantic_ai import (
     UsageLimitExceeded,
     UserError,
     UserPromptPart,
+    WebCitationSource,
     capture_run_messages,
 )
 from pydantic_ai.agent import Agent
@@ -92,7 +97,7 @@ with try_import() as imports_successful:
     from openai.types.responses.response_compaction_item import ResponseCompactionItem
     from openai.types.responses.response_output_message import Content, ResponseOutputMessage
     from openai.types.responses.response_output_refusal import ResponseOutputRefusal
-    from openai.types.responses.response_output_text import ResponseOutputText
+    from openai.types.responses.response_output_text import AnnotationContainerFileCitation, ResponseOutputText
     from openai.types.responses.response_reasoning_item import (
         Content as ReasoningContent,
         ResponseReasoningItem,
@@ -107,6 +112,7 @@ with try_import() as imports_successful:
     from pydantic_ai.models.openai import (
         OpenAIResponsesModel,
         OpenAIResponsesModelSettings,
+        _map_responses_citations,  # pyright: ignore[reportPrivateUsage]
         _resolve_openai_image_generation_size,  # pyright: ignore[reportPrivateUsage]
     )
     from pydantic_ai.providers.anthropic import AnthropicProvider
@@ -119,6 +125,142 @@ pytestmark = [
     pytest.mark.anyio,
     pytest.mark.vcr,
 ]
+
+
+def _remove_citations(messages: list[ModelMessage], events: list[Any] | None = None) -> list[Citation]:
+    """Collect citations while masking them from pre-citation snapshots."""
+    citations: list[Citation] = []
+    for model_message in messages:
+        if isinstance(model_message, ModelResponse):
+            for part in model_message.parts:
+                if isinstance(part, TextPart) and part.citations:
+                    citations.extend(part.citations)
+                    part.citations = None
+    citation_only_events: set[int] = set()
+    for event in events or []:
+        if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta) and event.delta.citations_delta:
+            citations.extend(event.delta.citations_delta)
+            if not event.delta.content_delta and event.delta.provider_details is None:
+                citation_only_events.add(id(event))
+            event.delta.citations_delta = None
+    if events is not None:
+        events[:] = [event for event in events if id(event) not in citation_only_events]
+    return citations
+
+
+def test_openai_unsupported_annotation_is_kept_as_provider_details():
+    citations, unsupported = _map_responses_citations(
+        [{'type': 'container_file_citation', 'container_id': 'container-1', 'file_id': 'file-1'}], 'answer'
+    )
+
+    assert citations is None
+    assert unsupported == [{'type': 'container_file_citation', 'container_id': 'container-1', 'file_id': 'file-1'}]
+
+
+async def test_openai_raw_unsupported_annotation_remains_replayable():
+    annotation = AnnotationContainerFileCitation(
+        container_id='container-1',
+        file_id='file-1',
+        filename='chart.png',
+        start_index=0,
+        end_index=0,
+        type='container_file_citation',
+    )
+    response = response_message(
+        [
+            ResponseOutputMessage(
+                id='message-1',
+                content=[ResponseOutputText(text='answer', type='output_text', annotations=[annotation])],
+                role='assistant',
+                status='completed',
+                type='message',
+            )
+        ]
+    )
+    model = OpenAIResponsesModel('gpt-5', provider=OpenAIProvider(api_key='not-used'))
+
+    result = model._process_response(  # pyright: ignore[reportPrivateUsage]
+        response,
+        OpenAIResponsesModelSettings(openai_include_raw_annotations=True),
+        ModelRequestParameters(),
+    )
+
+    [part] = result.parts
+    assert isinstance(part, TextPart)
+    assert part.provider_details == {
+        'annotations': [annotation.model_dump()],
+        'unsupported_annotations': [annotation.model_dump()],
+    }
+
+    _, mapped = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        [result], OpenAIResponsesModelSettings(), ModelRequestParameters()
+    )
+
+    assert mapped == [
+        {
+            'id': 'message-1',
+            'type': 'message',
+            'role': 'assistant',
+            'status': 'completed',
+            'content': [
+                {
+                    'type': 'output_text',
+                    'text': 'answer',
+                    'annotations': [annotation.model_dump()],
+                }
+            ],
+        }
+    ]
+
+
+async def test_openai_response_citations_are_replayed_to_the_same_provider():
+    model = OpenAIResponsesModel('gpt-5', provider=OpenAIProvider(api_key='not-used'))
+    history: list[ModelMessage] = [
+        ModelResponse(
+            parts=[
+                TextPart(
+                    'Answer [1]',
+                    id='message-1',
+                    provider_name='openai',
+                    citations=[
+                        Citation(
+                            sources=[WebCitationSource(url='https://example.com', title='Example')],
+                            anchor=CitationAnchor(7, 10, kind='marker'),
+                        )
+                    ],
+                )
+            ],
+            provider_name='openai',
+        )
+    ]
+
+    _, mapped = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        history, OpenAIResponsesModelSettings(), ModelRequestParameters()
+    )
+
+    assert mapped == [
+        {
+            'id': 'message-1',
+            'type': 'message',
+            'role': 'assistant',
+            'status': 'completed',
+            'content': [
+                {
+                    'type': 'output_text',
+                    'text': 'Answer [1]',
+                    'annotations': [
+                        {
+                            'type': 'url_citation',
+                            'url': 'https://example.com',
+                            'title': 'Example',
+                            'start_index': 7,
+                            'end_index': 10,
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
 
 
 async def _cleanup_openai_resources(file: Any, vector_store: Any, async_client: Any) -> None:  # pragma: lax no cover
@@ -1704,6 +1846,20 @@ async def test_openai_include_raw_annotations_streaming(allow_model_requests: No
     )
     assert isinstance(annotation_event, PartDeltaEvent)
     assert isinstance(annotation_event.delta, TextPartDelta)
+    assert annotation_event.index in {
+        event.index for event in events if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart)
+    }
+    assert annotation_event.delta.citations_delta == [
+        Citation(
+            sources=[
+                WebCitationSource(
+                    url='https://www.britannica.com/place/Mount-Columbia?utm_source=openai',
+                    title='Mount Columbia | mountain, Alberta, Canada | Britannica',
+                )
+            ],
+            anchor=CitationAnchor(77, 162, kind='marker'),
+        )
+    ]
     assert annotation_event.delta.provider_details == snapshot(
         {
             'annotations': [
@@ -1722,6 +1878,10 @@ async def test_openai_include_raw_annotations_streaming(allow_model_requests: No
     agent2 = Agent(model2, instructions=instructions, capabilities=[NativeTool(WebSearchTool())])
     async with agent2.run_stream_events(prompt) as event_stream2:
         events2 = [event async for event in event_stream2]
+    assert any(
+        isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta) and event.delta.citations_delta
+        for event in events2
+    )
     assert not any(
         (
             isinstance(event, PartDeltaEvent)
@@ -1776,7 +1936,10 @@ async def test_openai_responses_model_builtin_tools_web_search(allow_model_reque
     agent = Agent(model=model, model_settings=settings)
     result = await agent.run('Give me the top 3 news in the world today')
 
-    assert result.all_messages() == snapshot(
+    messages = result.all_messages()
+    citations = _remove_citations(messages)
+    assert citations and all(isinstance(citation.sources[0], WebCitationSource) for citation in citations)
+    assert messages == snapshot(
         [
             ModelRequest(
                 parts=[
@@ -6960,6 +7123,26 @@ plt.show()\r
                         content=IsStr(),
                         id='msg_68cdc398d3bc8190bbcf78c0293a4ca60187028ba77f15f7',
                         provider_name='openai',
+                        provider_details={
+                            'unsupported_annotations': [
+                                {
+                                    'container_id': 'cntr_68cdc387531c81938b4bee78c36acb820dbd09bdba403548',
+                                    'end_index': 0,
+                                    'file_id': 'cfile_68cdc395fb4c8191b644bc65a5529a72',
+                                    'filename': 'cfile_68cdc395fb4c8191b644bc65a5529a72.png',
+                                    'start_index': 0,
+                                    'type': 'container_file_citation',
+                                },
+                                {
+                                    'container_id': 'cntr_68cdc387531c81938b4bee78c36acb820dbd09bdba403548',
+                                    'end_index': 134,
+                                    'file_id': 'cfile_68cdc39bba888191b47ed8bda6111395',
+                                    'filename': 'y_equals_x_squared.png',
+                                    'start_index': 94,
+                                    'type': 'container_file_citation',
+                                },
+                            ]
+                        },
                     ),
                 ],
                 usage=RequestUsage(
@@ -7120,6 +7303,26 @@ If you want different colors or a holographic gradient background, tell me your 
 """,
                         id='msg_68cdc3d0303c8190b2a86413acbedbe60187028ba77f15f7',
                         provider_name='openai',
+                        provider_details={
+                            'unsupported_annotations': [
+                                {
+                                    'container_id': 'cntr_68cdc387531c81938b4bee78c36acb820dbd09bdba403548',
+                                    'end_index': 0,
+                                    'file_id': 'cfile_68cdc3cdff7c8191a4fe360b433c1619',
+                                    'filename': 'cfile_68cdc3cdff7c8191a4fe360b433c1619.png',
+                                    'start_index': 0,
+                                    'type': 'container_file_citation',
+                                },
+                                {
+                                    'container_id': 'cntr_68cdc387531c81938b4bee78c36acb820dbd09bdba403548',
+                                    'end_index': 217,
+                                    'file_id': 'cfile_68cdc3d48dfc819194084d06ee019433',
+                                    'filename': 'y_equals_x_squared_futuristic.png',
+                                    'start_index': 166,
+                                    'type': 'container_file_citation',
+                                },
+                            ]
+                        },
                     ),
                 ],
                 usage=RequestUsage(
@@ -7208,6 +7411,26 @@ async def test_openai_responses_code_execution_return_image_stream(allow_model_r
                         content=IsStr(),
                         id='msg_06c1a26fd89d07f20068dd937ecbd48197bd91dc501bd4a4d4',
                         provider_name='openai',
+                        provider_details={
+                            'unsupported_annotations': [
+                                {
+                                    'type': 'container_file_citation',
+                                    'container_id': 'cntr_68dd936a4cfc81908bdd4f2a2f542b5c0a0e691ad2bfd833',
+                                    'end_index': 0,
+                                    'file_id': 'cfile_68dd937c234081919ee5238a16b4fd87',
+                                    'filename': 'cfile_68dd937c234081919ee5238a16b4fd87.png',
+                                    'start_index': 0,
+                                },
+                                {
+                                    'type': 'container_file_citation',
+                                    'container_id': 'cntr_68dd936a4cfc81908bdd4f2a2f542b5c0a0e691ad2bfd833',
+                                    'end_index': 132,
+                                    'file_id': 'cfile_68dd9381192c81918f24ee3f0294cce6',
+                                    'filename': 'y_eq_x_squared_plot.png',
+                                    'start_index': 91,
+                                },
+                            ]
+                        },
                     ),
                 ],
                 usage=RequestUsage(
@@ -8623,10 +8846,58 @@ async def test_openai_responses_code_execution_return_image_stream(allow_model_r
             PartDeltaEvent(index=4, delta=TextPartDelta(content_delta='_plot')),
             PartDeltaEvent(index=4, delta=TextPartDelta(content_delta='.png')),
             PartDeltaEvent(index=4, delta=TextPartDelta(content_delta=')')),
+            PartDeltaEvent(
+                index=4,
+                delta=TextPartDelta(
+                    content_delta='',
+                    provider_details={
+                        'unsupported_annotations': [
+                            {
+                                'type': 'container_file_citation',
+                                'container_id': 'cntr_68dd936a4cfc81908bdd4f2a2f542b5c0a0e691ad2bfd833',
+                                'end_index': 0,
+                                'file_id': 'cfile_68dd937c234081919ee5238a16b4fd87',
+                                'filename': 'cfile_68dd937c234081919ee5238a16b4fd87.png',
+                                'start_index': 0,
+                            },
+                            {
+                                'type': 'container_file_citation',
+                                'container_id': 'cntr_68dd936a4cfc81908bdd4f2a2f542b5c0a0e691ad2bfd833',
+                                'end_index': 132,
+                                'file_id': 'cfile_68dd9381192c81918f24ee3f0294cce6',
+                                'filename': 'y_eq_x_squared_plot.png',
+                                'start_index': 91,
+                            },
+                        ]
+                    },
+                ),
+            ),
             PartEndEvent(
                 index=4,
                 part=TextPart(
-                    content=IsStr(), id='msg_06c1a26fd89d07f20068dd937ecbd48197bd91dc501bd4a4d4', provider_name='openai'
+                    content=IsStr(),
+                    id='msg_06c1a26fd89d07f20068dd937ecbd48197bd91dc501bd4a4d4',
+                    provider_name='openai',
+                    provider_details={
+                        'unsupported_annotations': [
+                            {
+                                'type': 'container_file_citation',
+                                'container_id': 'cntr_68dd936a4cfc81908bdd4f2a2f542b5c0a0e691ad2bfd833',
+                                'end_index': 0,
+                                'file_id': 'cfile_68dd937c234081919ee5238a16b4fd87',
+                                'filename': 'cfile_68dd937c234081919ee5238a16b4fd87.png',
+                                'start_index': 0,
+                            },
+                            {
+                                'type': 'container_file_citation',
+                                'container_id': 'cntr_68dd936a4cfc81908bdd4f2a2f542b5c0a0e691ad2bfd833',
+                                'end_index': 132,
+                                'file_id': 'cfile_68dd9381192c81918f24ee3f0294cce6',
+                                'filename': 'y_eq_x_squared_plot.png',
+                                'start_index': 91,
+                            },
+                        ]
+                    },
                 ),
             ),
         ]
@@ -11954,7 +12225,10 @@ async def test_openai_responses_model_file_search_tool(tmp_path: Path, allow_mod
         )
 
         result = await agent.run('What is the capital of France?')
-        assert result.all_messages() == snapshot(
+        messages = result.all_messages()
+        snapshot_messages = deepcopy(messages)
+        _remove_citations(snapshot_messages)
+        assert snapshot_messages == snapshot(
             [
                 ModelRequest(
                     parts=[
@@ -12006,9 +12280,10 @@ async def test_openai_responses_model_file_search_tool(tmp_path: Path, allow_mod
             ]
         )
 
-        messages = result.all_messages()
         result = await agent.run(user_prompt='Tell me about the Eiffel Tower.', message_history=messages)
-        assert result.new_messages() == snapshot(
+        new_messages = result.new_messages()
+        assert _remove_citations(new_messages)
+        assert new_messages == snapshot(
             [
                 ModelRequest(
                     parts=[
@@ -12159,6 +12434,22 @@ async def test_openai_responses_model_file_search_tool_stream(
 
         assert agent_run.result is not None
         messages = agent_run.result.all_messages()
+        citation_event_indices = {
+            event.index
+            for event in event_parts
+            if isinstance(event, PartDeltaEvent)
+            and isinstance(event.delta, TextPartDelta)
+            and event.delta.citations_delta
+        }
+        assert citation_event_indices
+        assert citation_event_indices <= {
+            event.index
+            for event in event_parts
+            if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart)
+        }
+        citations = _remove_citations(messages, event_parts)
+        assert citations and all(isinstance(citation.sources[0], FileCitationSource) for citation in citations)
+        assert all(citation.anchor is None and citation.provider_details == {'index': 30} for citation in citations)
         assert messages == snapshot(
             [
                 ModelRequest(
@@ -12306,7 +12597,9 @@ async def test_openai_responses_model_file_search_tool_with_results(
             model_settings=OpenAIResponsesModelSettings(openai_include_file_search_results=True),
         )
 
-        assert result.all_messages() == snapshot(
+        messages = result.all_messages()
+        assert _remove_citations(messages)
+        assert messages == snapshot(
             [
                 ModelRequest(
                     parts=[
@@ -12656,6 +12949,17 @@ async def test_openai_include_raw_annotations_non_streaming(allow_model_requests
     assert tool_call.args.get('type') == 'search'
 
     text_part = next(part for part in response.parts if isinstance(part, TextPart))
+    assert text_part.citations == [
+        Citation(
+            sources=[
+                WebCitationSource(
+                    url='https://www.britannica.com/place/Mount-Columbia?utm_source=openai',
+                    title='Mount Columbia | mountain, Alberta, Canada | Britannica',
+                )
+            ],
+            anchor=CitationAnchor(126, 211, kind='marker'),
+        )
+    ]
     assert text_part.provider_details and 'annotations' in text_part.provider_details
 
     # Test with annotations disabled (default)
@@ -12673,6 +12977,7 @@ async def test_openai_include_raw_annotations_non_streaming(allow_model_requests
     )
     response2 = cast(ModelResponse, messages2[1])
     text_part2 = next(part for part in response2.parts if isinstance(part, TextPart))
+    assert text_part2.citations
     assert not (text_part2.provider_details or {}).get('annotations')
 
 
